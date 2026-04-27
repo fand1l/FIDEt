@@ -1,0 +1,28 @@
+* {
+    font-family: "JetBrains Mono", "Fira Code", monospace;
+    font-size: 13px;
+}
+
+window {
+    background: #363636;
+    color: #d7dae0;
+}
+
+textview {
+    background: #232323;
+    color: #e6e6e6;
+}
+
+.file-list {
+    background: #2A2A2A;
+}
+
+.file-row:selected {
+    background: #3b82f6;
+    color: white;
+}
+
+.output-view {
+    background: #232323;
+    color: #b8f2b8;
+}
