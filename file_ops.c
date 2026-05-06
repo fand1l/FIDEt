@@ -98,3 +98,90 @@ gboolean file_ops_rename_file(AppState *state, const gchar *old_path, const gcha
     g_free(new_path);
     return TRUE;
 }
+
+static gchar *get_project_config_path(AppState *state) {
+    if (state == NULL || state->current_dir == NULL) return NULL;
+
+    gchar *dir_path = g_file_get_path(state->current_dir);
+    if (dir_path == NULL) return NULL;
+
+    gchar *config_path = g_build_filename(dir_path, ".fidet.ini", NULL);
+    g_free(dir_path);
+    return config_path;
+}
+
+gboolean file_ops_load_project_config(AppState *state, gchar **compile_args_out, GError **error) {
+    g_return_val_if_fail(state != NULL, FALSE);
+
+    if (compile_args_out != NULL) {
+        *compile_args_out = g_strdup("");
+    }
+
+    gchar *config_path = get_project_config_path(state);
+    if (config_path == NULL) {
+        g_set_error(error, G_FILE_ERROR, G_FILE_ERROR_INVAL, "No project directory selected.");
+        return FALSE;
+    }
+
+    if (!g_file_test(config_path, G_FILE_TEST_EXISTS)) {
+        g_free(config_path);
+        return TRUE;
+    }
+
+    GKeyFile *key_file = g_key_file_new();
+    gboolean ok = g_key_file_load_from_file(key_file, config_path, G_KEY_FILE_NONE, error);
+    if (!ok) {
+        g_key_file_unref(key_file);
+        g_free(config_path);
+        return FALSE;
+    }
+
+    gchar *compile_args = NULL;
+    if (g_key_file_has_key(key_file, "build", "compiler_args", NULL)) {
+        compile_args = g_key_file_get_string(key_file, "build", "compiler_args", error);
+        if (compile_args == NULL) {
+            g_key_file_unref(key_file);
+            g_free(config_path);
+            return FALSE;
+        }
+    } else {
+        compile_args = g_strdup("");
+    }
+
+    if (compile_args_out != NULL) {
+        g_free(*compile_args_out);
+        *compile_args_out = compile_args;
+    } else {
+        g_free(compile_args);
+    }
+
+    g_key_file_unref(key_file);
+    g_free(config_path);
+    return TRUE;
+}
+
+gboolean file_ops_save_project_config(AppState *state, const gchar *compile_args, GError **error) {
+    g_return_val_if_fail(state != NULL, FALSE);
+
+    gchar *config_path = get_project_config_path(state);
+    if (config_path == NULL) {
+        g_set_error(error, G_FILE_ERROR, G_FILE_ERROR_INVAL, "No project directory selected.");
+        return FALSE;
+    }
+
+    GKeyFile *key_file = g_key_file_new();
+    g_key_file_set_string(key_file, "build", "compiler_args", compile_args != NULL ? compile_args : "");
+
+    gsize len = 0;
+    gchar *data = g_key_file_to_data(key_file, &len, error);
+    g_key_file_unref(key_file);
+    if (data == NULL) {
+        g_free(config_path);
+        return FALSE;
+    }
+
+    gboolean ok = g_file_set_contents(config_path, data, (gssize)len, error);
+    g_free(data);
+    g_free(config_path);
+    return ok;
+}
