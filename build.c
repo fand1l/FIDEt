@@ -19,6 +19,43 @@ static gboolean run_process(char **argv, gchar **stdout_str, gchar **stderr_str,
                         stdout_str, stderr_str, exit_status, error);
 }
 
+static gboolean make_spawn_argv(const gchar *program, const gchar *args_text, gchar ***argv_out, GError **error) {
+    g_return_val_if_fail(program != NULL, FALSE);
+    g_return_val_if_fail(argv_out != NULL, FALSE);
+
+    gchar **args = NULL;
+    gint args_count = 0;
+
+    if (args_text != NULL && *args_text != '\0') {
+        if (!g_shell_parse_argv(args_text, &args_count, &args, error)) {
+            return FALSE;
+        }
+    }
+
+    gchar **argv = g_new0(gchar *, args_count + 2);
+    argv[0] = g_strdup(program);
+    for (gint i = 0; i < args_count; i++) {
+        argv[i + 1] = g_strdup(args[i]);
+    }
+
+    g_strfreev(args);
+    *argv_out = argv;
+    return TRUE;
+}
+
+static gboolean run_process_with_args(const gchar *program, const gchar *args_text,
+                                      gchar **stdout_str, gchar **stderr_str,
+                                      gint *exit_status, GError **error) {
+    gchar **argv = NULL;
+    if (!make_spawn_argv(program, args_text, &argv, error)) {
+        return FALSE;
+    }
+
+    gboolean ok = run_process(argv, stdout_str, stderr_str, exit_status, error);
+    g_strfreev(argv);
+    return ok;
+}
+
 void build_compile_current(AppState *state) {
     g_return_if_fail(state != NULL);
 
@@ -36,8 +73,32 @@ void build_compile_current(AppState *state) {
     }
 
     gchar *out_bin = make_output_binary_path(state->current_file_path);
-    char *argv[] = {"gcc", "-Wall", "-Wextra", "-pedantic",
-                    state->current_file_path, "-o", out_bin, NULL};
+    gchar **user_args = NULL;
+    gint user_count = 0;
+    GError *parse_err = NULL;
+    if (state->compile_args != NULL && *state->compile_args != '\0') {
+        if (!g_shell_parse_argv(state->compile_args, &user_count, &user_args, &parse_err)) {
+            ui_set_output_text(state, "Invalid compiler arguments:\n");
+            ui_append_output_text(state, parse_err->message);
+            ui_append_output_text(state, "\n");
+            g_clear_error(&parse_err);
+            g_free(out_bin);
+            return;
+        }
+    }
+
+    gchar **argv = g_new0(gchar *, user_count + 6 + 1);
+    gint idx = 0;
+    argv[idx++] = g_strdup("gcc");
+    for (gint i = 0; i < user_count; i++) {
+        argv[idx++] = g_strdup(user_args[i]);
+    }
+    argv[idx++] = g_strdup("-Wall");
+    argv[idx++] = g_strdup("-Wextra");
+    argv[idx++] = g_strdup("-pedantic");
+    argv[idx++] = g_strdup(state->current_file_path);
+    argv[idx++] = g_strdup("-o");
+    argv[idx++] = g_strdup(out_bin);
 
     gchar *out = NULL;
     gchar *err = NULL;
@@ -50,6 +111,8 @@ void build_compile_current(AppState *state) {
         ui_append_output_text(state, "\n");
         g_clear_error(&spawn_err);
         g_free(out_bin);
+        g_strfreev(user_args);
+        g_strfreev(argv);
         g_free(out);
         g_free(err);
         return;
@@ -70,11 +133,13 @@ void build_compile_current(AppState *state) {
     }
 
     g_free(out_bin);
+    g_strfreev(user_args);
+    g_strfreev(argv);
     g_free(out);
     g_free(err);
 }
 
-void build_run_current(AppState *state) {
+void build_run_current(AppState *state, const gchar *args_text) {
     g_return_if_fail(state != NULL);
 
     if (state->current_file_path == NULL) {
@@ -129,13 +194,12 @@ void build_run_current(AppState *state) {
     ui_append_output_text(state, "Compilation successful.\n");
     ui_append_output_text(state, "=== Run ===\n");
 
-    char *run_argv[] = {out_bin, NULL};
     gchar *r_out = NULL;
     gchar *r_err = NULL;
     gint r_status = 0;
     GError *r_spawn_err = NULL;
 
-    if (!run_process(run_argv, &r_out, &r_err, &r_status, &r_spawn_err)) {
+    if (!run_process_with_args(out_bin, args_text, &r_out, &r_err, &r_status, &r_spawn_err)) {
         ui_append_output_text(state, "Failed to run program:\n");
         ui_append_output_text(state, r_spawn_err->message);
         ui_append_output_text(state, "\n");
