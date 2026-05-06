@@ -7,6 +7,8 @@ static void app_state_free(gpointer data) {
     if (state->current_dir != NULL) g_object_unref(state->current_dir);
     g_free(state->current_file_path);
     g_free(state->selected_runnable_path);
+    g_free(state->compile_args);
+    if (state->expanded_folders != NULL) g_hash_table_unref(state->expanded_folders);
     g_free(state);
 }
 
@@ -15,6 +17,8 @@ static void app_activate(GtkApplication *app, gpointer user_data) {
 
     AppState *state = g_new0(AppState, 1);
     state->app = app;
+    state->compile_args = g_strdup("");
+    state->expanded_folders = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
 
     // Поточна директорія як корінь для file browser
     gchar *cwd = g_get_current_dir();
@@ -30,7 +34,7 @@ static void app_activate(GtkApplication *app, gpointer user_data) {
 }
 
 int main(int argc, char **argv) {
-    GtkApplication *app = gtk_application_new("com.example.miniide", G_APPLICATION_DEFAULT_FLAGS);
+    GtkApplication *app = gtk_application_new("com.fand1l.FIDET", G_APPLICATION_DEFAULT_FLAGS);
     g_signal_connect(app, "activate", G_CALLBACK(app_activate), NULL);
     int status = g_application_run(G_APPLICATION(app), argc, argv);
     g_object_unref(app);

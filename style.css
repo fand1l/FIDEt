@@ -22,6 +22,19 @@ textview {
     color: white;
 }
 
+.folder-row {
+    background: #2F2F2F;
+}
+
+.folder-row:selected {
+    background: #3b82f6;
+    color: white;
+}
+
+.folder-row:hover:not(:selected) {
+    background: #363636;
+}
+
 .output-view {
     background: #232323;
     color: #b8f2b8;
