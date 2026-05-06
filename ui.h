@@ -11,8 +11,11 @@ typedef struct _AppState {
     GtkWidget *open_btn;
     GtkWidget *save_btn;
     GtkWidget *compile_btn;
+    GtkWidget *compile_menu_btn;
     GtkWidget *run_btn;
+    GtkWidget *run_menu_btn;
     GtkWidget *run_binary_btn;
+    GtkWidget *run_args_entry;
 
     GtkWidget *file_list;      // GtkListBox
     GtkWidget *editor_view;    // GtkTextView
@@ -27,8 +30,10 @@ typedef struct _AppState {
     GFile *current_dir;
     gchar *current_file_path;
     gchar *selected_runnable_path;
+    gchar *compile_args;
     gboolean is_dirty;
     gboolean suppress_editor_change;
+    GHashTable *expanded_folders;  // Tracks expanded folder paths
 } AppState;
 
 void ui_build(AppState *state);

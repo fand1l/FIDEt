@@ -7,12 +7,26 @@ typedef struct {
     GtkWidget *window;
     GtkWidget *entry;
     void (*ok_cb)(AppState *, const gchar *);
+    gchar *initial_text;
 } PromptData;
 
 typedef struct {
     AppState *state;
     GtkWidget *window;
 } RunBinaryConfirmData;
+
+static void compile_args_ok_cb(AppState *state, const gchar *text);
+static void run_custom_args_ok_cb(AppState *state, const gchar *text);
+static void on_run_custom_args_action(GSimpleAction *action, GVariant *param, gpointer user_data);
+static void on_compile_args_action(GSimpleAction *action, GVariant *param, gpointer user_data);
+static void on_compile_args_reset_action(GSimpleAction *action, GVariant *param, gpointer user_data);
+static void on_run_binary_confirm_ok(GtkButton *btn, gpointer user_data);
+static void on_file_list_row_activated(GtkListBox *box, GtkListBoxRow *row, gpointer user_data);
+static void run_selected_with_custom_args(AppState *state, const gchar *args_text);
+static void show_error_dialog(GtkWindow *parent, const gchar *title, const gchar *message);
+static void prompt_text(GtkWindow *parent, const gchar *title, const gchar *placeholder,
+                        const gchar *initial_text,
+                        void (*ok_cb)(AppState *, const gchar *), AppState *state);
 
 static void update_window_title(AppState *state) {
     const gchar *base_title = "Mini C IDE (GTK4)";
@@ -74,7 +88,9 @@ static void on_prompt_cancel_clicked(GtkButton *btn, gpointer user_data) {
 
 static void on_prompt_window_destroy(GtkWidget *widget, gpointer user_data) {
     (void)widget;
-    g_free(user_data);
+    PromptData *data = user_data;
+    g_free(data->initial_text);
+    g_free(data);
 }
 
 static void on_file_list_right_click_pressed(GtkGestureClick *gesture, gint n_press,
@@ -134,6 +150,21 @@ static gboolean is_binary_like_filename(const gchar *name) {
            has_suffix_case_insensitive(name, ".a");
 }
 
+// Folder expansion management
+static gboolean folder_is_expanded(AppState *state, const gchar *folder_path) {
+    g_return_val_if_fail(state != NULL && folder_path != NULL, FALSE);
+    return g_hash_table_lookup(state->expanded_folders, folder_path) != NULL;
+}
+
+static void toggle_folder_expansion(AppState *state, const gchar *folder_path) {
+    g_return_if_fail(state != NULL && folder_path != NULL);
+    if (g_hash_table_lookup(state->expanded_folders, folder_path) != NULL) {
+        g_hash_table_remove(state->expanded_folders, folder_path);
+    } else {
+        g_hash_table_insert(state->expanded_folders, g_strdup(folder_path), GINT_TO_POINTER(1));
+    }
+}
+
 static gboolean is_runnable_binary_path(const gchar *path, const gchar *name) {
     if (path == NULL || name == NULL) return FALSE;
     return g_file_test(path, G_FILE_TEST_IS_EXECUTABLE) ||
@@ -142,8 +173,10 @@ static gboolean is_runnable_binary_path(const gchar *path, const gchar *name) {
 
 static void update_action_buttons_for_selection(AppState *state, gboolean text_like, gboolean runnable) {
     gtk_widget_set_visible(state->compile_btn, text_like);
+    gtk_widget_set_visible(state->compile_menu_btn, text_like);
     gtk_widget_set_visible(state->run_btn, text_like);
     gtk_widget_set_visible(state->run_binary_btn, runnable && !text_like);
+    gtk_widget_set_visible(state->run_menu_btn, text_like || runnable);
 }
 
 static void set_runnable_selection(AppState *state, const gchar *path_or_null) {
@@ -153,7 +186,45 @@ static void set_runnable_selection(AppState *state, const gchar *path_or_null) {
     }
 }
 
-static void run_selected_binary(AppState *state) {
+static gboolean make_spawn_argv(const gchar *program, const gchar *args_text, gchar ***argv_out, GError **error) {
+    g_return_val_if_fail(program != NULL, FALSE);
+    g_return_val_if_fail(argv_out != NULL, FALSE);
+
+    gchar **args = NULL;
+    gint args_count = 0;
+
+    if (args_text != NULL && *args_text != '\0') {
+        if (!g_shell_parse_argv(args_text, &args_count, &args, error)) {
+            return FALSE;
+        }
+    }
+
+    gchar **argv = g_new0(gchar *, args_count + 2);
+    argv[0] = g_strdup(program);
+    for (gint i = 0; i < args_count; i++) {
+        argv[i + 1] = g_strdup(args[i]);
+    }
+
+    g_strfreev(args);
+    *argv_out = argv;
+    return TRUE;
+}
+
+static gboolean run_process_with_args(const gchar *program, const gchar *args_text,
+                                      gchar **stdout_str, gchar **stderr_str,
+                                      gint *exit_status, GError **error) {
+    gchar **argv = NULL;
+    if (!make_spawn_argv(program, args_text, &argv, error)) {
+        return FALSE;
+    }
+
+    gboolean ok = g_spawn_sync(NULL, argv, NULL, G_SPAWN_SEARCH_PATH,
+                               NULL, NULL, stdout_str, stderr_str, exit_status, error);
+    g_strfreev(argv);
+    return ok;
+}
+
+static void run_selected_binary(AppState *state, const gchar *args_text) {
     if (state->selected_runnable_path == NULL) {
         ui_set_output_text(state, "No runnable binary selected.\n");
         return;
@@ -163,10 +234,9 @@ static void run_selected_binary(AppState *state) {
     gchar *err = NULL;
     gint status = 0;
     GError *spawn_err = NULL;
-    char *argv[] = {state->selected_runnable_path, NULL};
 
-    if (!g_spawn_sync(NULL, argv, NULL, G_SPAWN_SEARCH_PATH,
-                      NULL, NULL, &out, &err, &status, &spawn_err)) {
+    if (!run_process_with_args(state->selected_runnable_path, args_text,
+                               &out, &err, &status, &spawn_err)) {
         ui_set_output_text(state, "Failed to run selected binary:\n");
         ui_append_output_text(state, spawn_err->message);
         ui_append_output_text(state, "\n");
@@ -209,8 +279,66 @@ static void on_run_binary_confirm_cancel(GtkButton *btn, gpointer user_data) {
 static void on_run_binary_confirm_ok(GtkButton *btn, gpointer user_data) {
     (void)btn;
     RunBinaryConfirmData *data = user_data;
-    run_selected_binary(data->state);
+    run_selected_binary(data->state, NULL);
     gtk_window_destroy(GTK_WINDOW(data->window));
+}
+
+static void run_selected_with_custom_args(AppState *state, const gchar *args_text) {
+    if (state->selected_runnable_path != NULL && state->current_file_path == NULL) {
+        run_selected_binary(state, args_text);
+        return;
+    }
+
+    build_run_current(state, args_text);
+}
+
+static void on_run_custom_args_action(GSimpleAction *action, GVariant *param, gpointer user_data) {
+    (void)action; (void)param;
+    AppState *state = user_data;
+    prompt_text(GTK_WINDOW(state->window), "Run with custom args", "--help", NULL,
+                run_custom_args_ok_cb, state);
+}
+
+static void on_compile_args_action(GSimpleAction *action, GVariant *param, gpointer user_data) {
+    (void)action; (void)param;
+    AppState *state = user_data;
+    prompt_text(GTK_WINDOW(state->window), "Compiler arguments", "-O2 -g",
+                state->compile_args != NULL ? state->compile_args : "",
+                compile_args_ok_cb, state);
+}
+
+static void on_compile_args_reset_action(GSimpleAction *action, GVariant *param, gpointer user_data) {
+    (void)action; (void)param;
+    AppState *state = user_data;
+    g_free(state->compile_args);
+    state->compile_args = g_strdup("");
+
+    GError *error = NULL;
+    if (!file_ops_save_project_config(state, state->compile_args, &error)) {
+        show_error_dialog(GTK_WINDOW(state->window), "Save config failed", error->message);
+        g_clear_error(&error);
+        return;
+    }
+
+    ui_set_output_text(state, "Compiler arguments reset.\n");
+}
+
+static void run_custom_args_ok_cb(AppState *state, const gchar *text) {
+    run_selected_with_custom_args(state, text);
+}
+
+static void compile_args_ok_cb(AppState *state, const gchar *text) {
+    g_free(state->compile_args);
+    state->compile_args = g_strdup(text != NULL ? text : "");
+
+    GError *error = NULL;
+    if (!file_ops_save_project_config(state, state->compile_args, &error)) {
+        show_error_dialog(GTK_WINDOW(state->window), "Save config failed", error->message);
+        g_clear_error(&error);
+        return;
+    }
+
+    ui_set_output_text(state, "Compiler arguments saved.\n");
 }
 
 static void on_run_binary_clicked(GtkButton *btn, gpointer user_data) {
@@ -239,6 +367,10 @@ static void on_run_binary_clicked(GtkButton *btn, gpointer user_data) {
     gtk_label_set_wrap(GTK_LABEL(label), TRUE);
     gtk_label_set_xalign(GTK_LABEL(label), 0.0f);
 
+    GtkWidget *args_info = gtk_label_new("Launch arguments will be passed after the executable name.");
+    gtk_label_set_wrap(GTK_LABEL(args_info), TRUE);
+    gtk_label_set_xalign(GTK_LABEL(args_info), 0.0f);
+
     GtkWidget *btn_row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
     gtk_widget_set_halign(btn_row, GTK_ALIGN_END);
     GtkWidget *cancel_btn = gtk_button_new_with_label("Cancel");
@@ -255,6 +387,7 @@ static void on_run_binary_clicked(GtkButton *btn, gpointer user_data) {
     g_signal_connect(confirm, "destroy", G_CALLBACK(on_run_binary_confirm_destroy), data);
 
     gtk_box_append(GTK_BOX(content), label);
+    gtk_box_append(GTK_BOX(content), args_info);
     gtk_box_append(GTK_BOX(content), btn_row);
     gtk_window_set_child(GTK_WINDOW(confirm), content);
     gtk_window_present(GTK_WINDOW(confirm));
@@ -316,6 +449,15 @@ static void on_open_response(GObject *source, GAsyncResult *result, gpointer use
 
     g_clear_pointer(&state->current_file_path, g_free);
     set_runnable_selection(state, NULL);
+    g_clear_pointer(&state->compile_args, g_free);
+    state->compile_args = g_strdup("");
+
+    GError *config_error = NULL;
+    if (!file_ops_load_project_config(state, &state->compile_args, &config_error)) {
+        show_error_dialog(GTK_WINDOW(state->window), "Config load failed", config_error->message);
+        g_clear_error(&config_error);
+    }
+
     update_action_buttons_for_selection(state, TRUE, FALSE);
     ui_set_dirty_state(state, FALSE);
     state->suppress_editor_change = TRUE;
@@ -367,22 +509,126 @@ static void on_compile_clicked(GtkButton *btn, gpointer user_data) {
 
 static void on_run_clicked(GtkButton *btn, gpointer user_data) {
     (void)btn;
-    build_run_current((AppState *)user_data);
+    build_run_current((AppState *)user_data, NULL);
 }
 
-static GtkWidget *make_file_row(const gchar *filename, const gchar *full_path) {
+static GtkWidget *make_folder_row(const gchar *folder_name, const gchar *full_path,
+                                  gboolean is_expanded, guint depth) {
     GtkWidget *row = gtk_list_box_row_new();
+    GtkWidget *box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+    gtk_widget_set_margin_start(box, (gint)depth * 20);
+    gtk_widget_set_margin_end(box, 8);
+    gtk_widget_set_margin_top(box, 4);
+    gtk_widget_set_margin_bottom(box, 4);
+    
+    // Expand/collapse icon
+    const gchar *icon_name = is_expanded ? "pan-down-symbolic" : "pan-end-symbolic";
+    GtkWidget *expander_icon = gtk_image_new_from_icon_name(icon_name);
+    gtk_box_append(GTK_BOX(box), expander_icon);
+    
+    // Folder icon
+    GtkWidget *folder_icon = gtk_image_new_from_icon_name("folder-symbolic");
+    gtk_box_append(GTK_BOX(box), folder_icon);
+    
+    // Folder name
+    GtkWidget *label = gtk_label_new(folder_name);
+    gtk_label_set_xalign(GTK_LABEL(label), 0.0f);
+    gtk_widget_set_hexpand(label, TRUE);
+    gtk_box_append(GTK_BOX(box), label);
+    
+    gtk_list_box_row_set_child(GTK_LIST_BOX_ROW(row), box);
+    
+    // Add CSS class for styling
+    gtk_widget_add_css_class(row, "folder-row");
+    
+    g_object_set_data_full(G_OBJECT(row), "full-path", g_strdup(full_path), g_free);
+    g_object_set_data(G_OBJECT(row), "is-folder", GINT_TO_POINTER(TRUE));
+    
+    return row;
+}
+
+static GtkWidget *make_file_row(const gchar *filename, const gchar *full_path, guint depth) {
+    GtkWidget *row = gtk_list_box_row_new();
+    GtkWidget *box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
+    gtk_widget_set_margin_start(box, (gint)depth * 20);
+    gtk_widget_set_margin_end(box, 8);
+    gtk_widget_set_margin_top(box, 4);
+    gtk_widget_set_margin_bottom(box, 4);
+
     GtkWidget *label = gtk_label_new(filename);
     gtk_label_set_xalign(GTK_LABEL(label), 0.0f);
     gtk_widget_set_margin_start(label, 8);
     gtk_widget_set_margin_end(label, 8);
-    gtk_widget_set_margin_top(label, 6);
-    gtk_widget_set_margin_bottom(label, 6);
-    gtk_list_box_row_set_child(GTK_LIST_BOX_ROW(row), label);
+    gtk_widget_set_margin_top(label, 2);
+    gtk_widget_set_margin_bottom(label, 2);
+    gtk_widget_set_hexpand(label, TRUE);
+    gtk_box_append(GTK_BOX(box), label);
+    gtk_list_box_row_set_child(GTK_LIST_BOX_ROW(row), box);
 
     g_object_set_data_full(G_OBJECT(row), "full-path", g_strdup(full_path), g_free);
     gtk_widget_add_css_class(row, "file-row");
     return row;
+}
+
+static void append_directory_entries(AppState *state, GtkListBox *list_box, const gchar *dir_path, guint depth) {
+    if (state == NULL || list_box == NULL || dir_path == NULL) return;
+
+    GDir *dir = g_dir_open(dir_path, 0, NULL);
+    if (dir == NULL) return;
+
+    GSList *folders = NULL;
+    GSList *files = NULL;
+
+    const gchar *name = NULL;
+    while ((name = g_dir_read_name(dir)) != NULL) {
+        gchar *full = g_build_filename(dir_path, name, NULL);
+
+        if (g_file_test(full, G_FILE_TEST_IS_DIR)) {
+            folders = g_slist_prepend(folders, g_strdup(full));
+        } else if (g_file_test(full, G_FILE_TEST_IS_REGULAR)) {
+            gboolean show = is_text_like_filename(name) ||
+                            is_binary_like_filename(name) ||
+                            g_file_test(full, G_FILE_TEST_IS_EXECUTABLE);
+            if (show) {
+                files = g_slist_prepend(files, g_strdup(full));
+            }
+        }
+
+        g_free(full);
+    }
+
+    g_dir_close(dir);
+
+    folders = g_slist_sort(folders, (GCompareFunc)g_strcmp0);
+    files = g_slist_sort(files, (GCompareFunc)g_strcmp0);
+
+    for (GSList *l = folders; l != NULL; l = l->next) {
+        gchar *folder_full_path = l->data;
+        gchar *folder_name = g_path_get_basename(folder_full_path);
+        gboolean is_expanded = folder_is_expanded(state, folder_full_path);
+
+        GtkWidget *folder_row = make_folder_row(folder_name, folder_full_path, is_expanded, depth);
+        gtk_list_box_append(list_box, folder_row);
+
+        if (is_expanded) {
+            append_directory_entries(state, list_box, folder_full_path, depth + 1);
+        }
+
+        g_free(folder_name);
+    }
+
+    for (GSList *l = files; l != NULL; l = l->next) {
+        gchar *file_full_path = l->data;
+        gchar *file_name = g_path_get_basename(file_full_path);
+
+        GtkWidget *row = make_file_row(file_name, file_full_path, depth);
+        gtk_list_box_append(list_box, row);
+
+        g_free(file_name);
+    }
+
+    g_slist_free_full(folders, g_free);
+    g_slist_free_full(files, g_free);
 }
 
 void ui_refresh_file_list(AppState *state) {
@@ -398,34 +644,8 @@ void ui_refresh_file_list(AppState *state) {
     if (state->current_dir == NULL) return;
 
     gchar *dir_path = g_file_get_path(state->current_dir);
-    GDir *dir = g_dir_open(dir_path, 0, NULL);
-    if (dir == NULL) {
-        g_free(dir_path);
-        return;
-    }
 
-    const gchar *name = NULL;
-    while ((name = g_dir_read_name(dir)) != NULL) {
-        gchar *full = g_build_filename(dir_path, name, NULL);
-        if (!g_file_test(full, G_FILE_TEST_IS_REGULAR)) {
-            g_free(full);
-            continue;
-        }
-
-        gboolean show = is_text_like_filename(name) ||
-                        is_binary_like_filename(name) ||
-                        g_file_test(full, G_FILE_TEST_IS_EXECUTABLE);
-        if (!show) {
-            g_free(full);
-            continue;
-        }
-
-        GtkWidget *row = make_file_row(name, full);
-        gtk_list_box_append(GTK_LIST_BOX(state->file_list), row);
-        g_free(full);
-    }
-
-    g_dir_close(dir);
+    append_directory_entries(state, list_box, dir_path, 0);
     g_free(dir_path);
 }
 
@@ -450,6 +670,10 @@ static void on_file_selected(GtkListBox *box, GtkListBoxRow *row, gpointer user_
     if (row == NULL) {
         set_runnable_selection(state, NULL);
         update_action_buttons_for_selection(state, TRUE, FALSE);
+        return;
+    }
+
+    if (g_object_get_data(G_OBJECT(row), "is-folder") != NULL) {
         return;
     }
 
@@ -481,6 +705,20 @@ static void on_file_selected(GtkListBox *box, GtkListBoxRow *row, gpointer user_
     }
 }
 
+static void on_file_list_row_activated(GtkListBox *box, GtkListBoxRow *row, gpointer user_data) {
+    (void)box;
+    AppState *state = user_data;
+    if (row == NULL || state == NULL) return;
+
+    if (g_object_get_data(G_OBJECT(row), "is-folder") != NULL) {
+        const gchar *folder_path = g_object_get_data(G_OBJECT(row), "full-path");
+        if (folder_path != NULL) {
+            toggle_folder_expansion(state, folder_path);
+            ui_refresh_file_list(state);
+        }
+    }
+}
+
 static void do_create_file(AppState *state, const gchar *name) {
     GError *error = NULL;
     if (!file_ops_create_new(state, name, &error)) {
@@ -505,6 +743,7 @@ static void do_rename_file(AppState *state, const gchar *old_path, const gchar *
 }
 
 static void prompt_text(GtkWindow *parent, const gchar *title, const gchar *placeholder,
+                        const gchar *initial_text,
                         void (*ok_cb)(AppState *, const gchar *), AppState *state) {
     GtkWidget *dlg = gtk_window_new();
     gtk_window_set_title(GTK_WINDOW(dlg), title != NULL ? title : "Input");
@@ -519,6 +758,10 @@ static void prompt_text(GtkWindow *parent, const gchar *title, const gchar *plac
 
     GtkWidget *entry = gtk_entry_new();
     gtk_entry_set_placeholder_text(GTK_ENTRY(entry), placeholder);
+    if (initial_text != NULL) {
+        gtk_editable_set_text(GTK_EDITABLE(entry), initial_text);
+        gtk_editable_select_region(GTK_EDITABLE(entry), 0, -1);
+    }
     gtk_box_append(GTK_BOX(content), entry);
 
     GtkWidget *btn_row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
@@ -534,6 +777,7 @@ static void prompt_text(GtkWindow *parent, const gchar *title, const gchar *plac
     data->window = dlg;
     data->entry = entry;
     data->ok_cb = ok_cb;
+    data->initial_text = g_strdup(initial_text);
 
     g_signal_connect(ok_btn, "clicked", G_CALLBACK(on_prompt_ok_clicked), data);
     g_signal_connect(cancel_btn, "clicked", G_CALLBACK(on_prompt_cancel_clicked), data);
@@ -546,7 +790,7 @@ static void prompt_text(GtkWindow *parent, const gchar *title, const gchar *plac
 static void on_create_action(GSimpleAction *action, GVariant *param, gpointer user_data) {
     (void)action; (void)param;
     AppState *state = user_data;
-    prompt_text(GTK_WINDOW(state->window), "Create new file", "example.c", do_create_file, state);
+    prompt_text(GTK_WINDOW(state->window), "Create new file", "example.c", NULL, do_create_file, state);
 }
 
 static void rename_ok_cb(AppState *state, const gchar *new_name) {
@@ -560,7 +804,7 @@ static void rename_ok_cb(AppState *state, const gchar *new_name) {
 static void on_rename_action(GSimpleAction *action, GVariant *param, gpointer user_data) {
     (void)action; (void)param;
     AppState *state = user_data;
-    prompt_text(GTK_WINDOW(state->window), "Rename file", "new_name.c", rename_ok_cb, state);
+    prompt_text(GTK_WINDOW(state->window), "Rename file", "new_name.c", NULL, rename_ok_cb, state);
 }
 
 void ui_load_css(void) {
@@ -586,21 +830,57 @@ void ui_build(AppState *state) {
     state->open_btn = gtk_button_new_with_label("Open");
     state->save_btn = gtk_button_new_with_label("Save");
     state->compile_btn = gtk_button_new_with_label("Compile");
+    state->compile_menu_btn = gtk_menu_button_new();
+    gtk_menu_button_set_icon_name(GTK_MENU_BUTTON(state->compile_menu_btn), "pan-down-symbolic");
     state->run_btn = gtk_button_new_with_label("Run");
     state->run_binary_btn = gtk_button_new_with_label("Run");
+    state->run_menu_btn = gtk_menu_button_new();
+    gtk_menu_button_set_icon_name(GTK_MENU_BUTTON(state->run_menu_btn), "pan-down-symbolic");
     gtk_widget_set_visible(state->run_binary_btn, FALSE);
+
+    GtkWidget *compile_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
+    gtk_box_append(GTK_BOX(compile_box), state->compile_btn);
+    gtk_box_append(GTK_BOX(compile_box), state->compile_menu_btn);
+
+    GtkWidget *run_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
+    gtk_box_append(GTK_BOX(run_box), state->run_btn);
+    gtk_box_append(GTK_BOX(run_box), state->run_binary_btn);
+    gtk_box_append(GTK_BOX(run_box), state->run_menu_btn);
+
+    GMenu *compile_menu = g_menu_new();
+    g_menu_append(compile_menu, "Compiler arguments...", "app.compile-edit-args");
+    g_menu_append(compile_menu, "Reset compiler arguments", "app.compile-reset-args");
+    gtk_menu_button_set_menu_model(GTK_MENU_BUTTON(state->compile_menu_btn), G_MENU_MODEL(compile_menu));
+    g_object_unref(compile_menu);
+
+    GMenu *run_menu = g_menu_new();
+    g_menu_append(run_menu, "Run with custom args...", "app.run-custom-args");
+    gtk_menu_button_set_menu_model(GTK_MENU_BUTTON(state->run_menu_btn), G_MENU_MODEL(run_menu));
+    g_object_unref(run_menu);
 
     gtk_header_bar_pack_start(GTK_HEADER_BAR(state->headerbar), state->open_btn);
     gtk_header_bar_pack_start(GTK_HEADER_BAR(state->headerbar), state->save_btn);
-    gtk_header_bar_pack_end(GTK_HEADER_BAR(state->headerbar), state->run_binary_btn);
-    gtk_header_bar_pack_end(GTK_HEADER_BAR(state->headerbar), state->run_btn);
-    gtk_header_bar_pack_end(GTK_HEADER_BAR(state->headerbar), state->compile_btn);
+    gtk_header_bar_pack_end(GTK_HEADER_BAR(state->headerbar), run_box);
+    gtk_header_bar_pack_end(GTK_HEADER_BAR(state->headerbar), compile_box);
 
     g_signal_connect(state->open_btn, "clicked", G_CALLBACK(on_open_clicked), state);
     g_signal_connect(state->save_btn, "clicked", G_CALLBACK(on_save_clicked), state);
     g_signal_connect(state->compile_btn, "clicked", G_CALLBACK(on_compile_clicked), state);
     g_signal_connect(state->run_btn, "clicked", G_CALLBACK(on_run_clicked), state);
     g_signal_connect(state->run_binary_btn, "clicked", G_CALLBACK(on_run_binary_clicked), state);
+
+    GSimpleAction *run_custom_args = g_simple_action_new("run-custom-args", NULL);
+    GSimpleAction *compile_edit_args = g_simple_action_new("compile-edit-args", NULL);
+    GSimpleAction *compile_reset_args = g_simple_action_new("compile-reset-args", NULL);
+    g_signal_connect(run_custom_args, "activate", G_CALLBACK(on_run_custom_args_action), state);
+    g_signal_connect(compile_edit_args, "activate", G_CALLBACK(on_compile_args_action), state);
+    g_signal_connect(compile_reset_args, "activate", G_CALLBACK(on_compile_args_reset_action), state);
+    g_action_map_add_action(G_ACTION_MAP(state->app), G_ACTION(run_custom_args));
+    g_action_map_add_action(G_ACTION_MAP(state->app), G_ACTION(compile_edit_args));
+    g_action_map_add_action(G_ACTION_MAP(state->app), G_ACTION(compile_reset_args));
+    g_object_unref(run_custom_args);
+    g_object_unref(compile_edit_args);
+    g_object_unref(compile_reset_args);
 
     state->main_vpaned = gtk_paned_new(GTK_ORIENTATION_VERTICAL);
     state->main_hpaned = gtk_paned_new(GTK_ORIENTATION_HORIZONTAL);
@@ -609,6 +889,8 @@ void ui_build(AppState *state) {
     state->file_list = gtk_list_box_new();
     gtk_widget_add_css_class(state->file_list, "file-list");
     g_signal_connect(state->file_list, "row-selected", G_CALLBACK(on_file_selected), state);
+    gtk_list_box_set_activate_on_single_click(GTK_LIST_BOX(state->file_list), TRUE);
+    g_signal_connect(state->file_list, "row-activated", G_CALLBACK(on_file_list_row_activated), state);
 
     GtkWidget *left_scroll = gtk_scrolled_window_new();
     gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(left_scroll), state->file_list);
